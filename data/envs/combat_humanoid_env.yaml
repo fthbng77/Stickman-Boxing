@@ -39,7 +39,6 @@ key_bodies: ["head", "right_hand", "left_hand", "right_foot", "left_foot"]
 opponent_key_bodies: ["head", "right_hand", "left_hand", "right_foot", "left_foot"]
 
 # Independent state-driven demo controllers (seconds, metres).
-attack_duration: 1.5
 recover_duration: [0.6, 1.0]
 attack_cooldown: [0.8, 1.6]
 attack_range: 0.58

@@ -19,14 +19,20 @@ class BoxingIntent(IntEnum):
 
 
 class BoxingReferenceController:
-    def boxing_pose(self, base, joint_ids, variant, time, attacking):
-        """Two-arm guard and smooth left-jab/right-cross joint trajectories.
+    @staticmethod
+    def punch_duration(variant):
+        """Jab, cross and lead-hook animation lengths in seconds."""
+        return torch.where(variant == 0, 0.9,
+                           torch.where(variant == 1, 1.2, 1.0))
 
-        Shoulder coordinates are exponential maps. Variant 0 uses the left
-        arm; variant 1 uses the right. Both trajectories end exactly in guard.
+    def boxing_pose(self, base, joint_ids, variant, time, attacking):
+        """Guard plus jab, cross and lead-hook joint trajectories.
+
+        Shoulder coordinates are exponential maps. Variant 1 uses the right
+        arm; variants 0 and 2 use the left. Every trajectory returns to guard.
         """
         pose = base.clone()
-        duration = torch.where(variant == 0, 0.9, 1.2)
+        duration = self.punch_duration(variant)
         phase = (time / duration).clamp(0, 1)
         progress = torch.where(phase < 0.45, phase / 0.45,
                                (1 - phase) / 0.55).clamp(0, 1)
@@ -35,11 +41,14 @@ class BoxingReferenceController:
         for arm, (shoulder, _, elbow) in enumerate(joint_ids):
             sign = 1.0 if arm == 0 else -1.0
             guard = base.new_tensor([1.1302 * sign, -0.5409, 0.5800 * sign])
-            extended = base.new_tensor([0.0, 0.0, 1.85 * sign])
-            selected = variant == (1 if arm == 0 else 0)
+            straight = base.new_tensor([0.0, 0.0, 1.85 * sign])
+            hook = base.new_tensor([0.20, 0.0, 1.60 * sign])
+            extended = torch.where((variant == 2)[:, None], hook, straight)
+            selected = (variant == 1) if arm == 0 else (variant != 1)
             blend = progress * selected
             pose[:, shoulder:shoulder + 3] = guard + blend[:, None] * (extended - guard)
-            pose[:, elbow] = sign * (2.1832 - 2.0332 * blend)
+            extension = torch.where(variant == 2, 0.65, 0.15)
+            pose[:, elbow] = sign * (2.1832 + (extension - 2.1832) * blend)
         active = attacking & (phase >= 0.25) & (phase <= 0.6)
         return pose, active
 
