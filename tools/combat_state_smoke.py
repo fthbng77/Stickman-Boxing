@@ -10,6 +10,7 @@ from envs.combat_env import CombatState as S
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--visualize', action='store_true')
+parser.add_argument('--motor-pose', action='store_true')
 args = parser.parse_args()
 if args.visualize:
     from util.display import ensure_virtual_display
@@ -21,15 +22,23 @@ if args.visualize:
     out.parent.mkdir(parents=True, exist_ok=True)
     writer = imageio.get_writer(str(out), fps=30, codec='libx264', macro_block_size=2)
 torch.manual_seed(7)
-env = build_env('data/envs/combat_humanoid_env.yaml',
-                'data/engines/newton_engine.yaml', 1, 'cuda:0', args.visualize)
+if args.motor_pose:
+    from envs.combat_env import CombatEnv
+    from envs.env_builder import load_configs
+    env_config, engine_config = load_configs('data/envs/combat_humanoid_env.yaml',
+                                             'data/engines/newton_engine.yaml')
+    env_config['motor_pose'] = True
+    env = CombatEnv(env_config, engine_config, 1, 'cuda:0', args.visualize)
+else:
+    env = build_env('data/envs/combat_humanoid_env.yaml',
+                    'data/engines/newton_engine.yaml', 1, 'cuda:0', args.visualize)
 env.reset()
 action = torch.zeros((1, env.get_action_space().shape[0]), device='cuda:0')
 seen = [set(), set()]
 transitions = [set(), set()]
 previous = [S.IDLE, S.IDLE]
 hits = [0, 0]
-hits_by_punch = [[0, 0, 0], [0, 0, 0]]
+hits_by_punch = [[0] * 6, [0] * 6]
 footwork_travel = [0.0, 0.0]
 previous_positions = [env._engine.get_root_pos(obj)[0, :2].clone()
                       for obj in (env._get_char_id(), env._get_opponent_id())]
@@ -42,6 +51,9 @@ max_raw_slip = 0.0
 support_samples = 0
 support_contacts = 0
 max_ik_error = 0.0
+max_motor_error = 0.0
+max_motor_root_correction = 0.0
+root_height_range = [[float('inf'), float('-inf')] for _ in range(2)]
 for step in range(900):
     obs, reward, done, info = env.step(action)
     assert torch.isfinite(obs).all()
@@ -66,6 +78,9 @@ for step in range(900):
         if states[side] == S.ATTACK:
             punches_seen[side].add(int(info[('fighter', 'opponent')[side] + '_attack_variant'][0]))
         obj = env._get_char_id() if side == 0 else env._get_opponent_id()
+        height = float(env._engine.get_root_pos(obj)[0, 2])
+        root_height_range[side][0] = min(root_height_range[side][0], height)
+        root_height_range[side][1] = max(root_height_range[side][1], height)
         current_pos = env._engine.get_root_pos(obj)[0, :2]
         if states[side] in (S.IDLE, S.RECOVER) and float(env._attack_cooldown[0, side]) > 0:
             footwork_travel[side] += float(torch.linalg.vector_norm(current_pos - previous_positions[side]))
@@ -79,6 +94,10 @@ for step in range(900):
         if foot >= 0:
             support_contacts += int(info['foot_canvas_contact'][0, side, foot])
     max_ik_error = max(max_ik_error, float(info['support_ik_error'].max()))
+    if step >= 60:
+        max_motor_error = max(max_motor_error, float(info['motor_pose_error'].max()))
+        max_motor_root_correction = max(
+            max_motor_root_correction, float(info['motor_root_correction'].max()))
     for obj in (env._get_char_id(), env._get_opponent_id()):
         pos = env._engine.get_root_pos(obj)[0]
         xmin, xmax, ymin, ymax = env._ring_bounds
@@ -105,6 +124,13 @@ for step in range(900):
             frame.save(str(out.with_name(f'state_{step // 3:02d}.png')))
 if args.visualize:
     writer.close()
+if args.motor_pose:
+    print('Motor diagnostics:', hits, hits_by_punch, punches_seen,
+          footwork_travel, f'contacts={support_contacts}/{support_samples}',
+          f'slip={max_support_slip:.4f}', f'ik={max_ik_error:.4f}',
+          f'pose_error={max_motor_error:.4f}',
+          f'root_correction={max_motor_root_correction:.4f}',
+          f'root_heights={root_height_range}', flush=True)
 for side in range(2):
     assert {S.IDLE, S.APPROACH, S.ATTACK, S.RECOVER} <= seen[side], seen
     assert (S.ATTACK, S.RECOVER) in transitions[side]
@@ -112,32 +138,48 @@ assert any(S.BLOCK in states for states in seen), seen
 assert any(S.SLIP in states for states in seen), seen
 assert any(S.BACKSTEP in states for states in seen), seen
 assert min(hits) > 0, hits
-assert sum(punch_hits[2] for punch_hits in hits_by_punch) > 0, hits_by_punch
-assert all(combo_seen), combo_seen
-assert all(len(variants) >= 3 for variants in punches_seen), punches_seen
+if not args.motor_pose:
+    assert sum(punch_hits[2] for punch_hits in hits_by_punch) > 0, hits_by_punch
+assert (any(combo_seen) if args.motor_pose else all(combo_seen)), combo_seen
+if args.motor_pose:
+    assert len(set.union(*punches_seen)) >= 4, punches_seen
+else:
+    assert set.union(*punches_seen) == {0, 1, 2, 3, 4, 5}, punches_seen
 assert all(all(a != b for a, b in zip(starts, starts[1:])) for starts in attack_starts), attack_starts
 assert min(footwork_travel) > 1.0, footwork_travel
 assert all(signs == {-1, 1} for signs in orbit_directions), orbit_directions
 assert support_samples > 50, support_samples
-assert max_support_slip < 0.03, max_support_slip
-assert support_contacts / support_samples > 0.7, (support_contacts, support_samples)
-assert max_ik_error < 0.02, max_ik_error
+assert max_support_slip < (0.035 if args.motor_pose else 0.03), max_support_slip
+assert support_contacts / support_samples > (0.8 if args.motor_pose else 0.7), (support_contacts, support_samples)
+if args.motor_pose:
+    assert max_motor_error < 1.0, max_motor_error
+    assert all(lo > env._ring_floor_height + 0.65 and
+               hi < env._ring_floor_height + 1.1 for lo, hi in root_height_range), root_height_range
+else:
+    assert max_ik_error < 0.02, max_ik_error
 print('900 steps passed; hits:', hits, flush=True)
-print('Hits by jab/cross/hook:', hits_by_punch, flush=True)
+print('Hits by jab/cross/lead hook/rear hook/uppercut/body jab:', hits_by_punch, flush=True)
 print('Punch variants:', punches_seen, '; attack starts:', attack_starts, flush=True)
 print('Cooldown footwork travel:', footwork_travel, 'm; orbit directions:', orbit_directions, flush=True)
 print(f'Support footfall samples: {support_samples}; raw/corrected max slip: {max_raw_slip:.4f}/{max_support_slip:.4f} m', flush=True)
 print(f'Canvas contact: {support_contacts}/{support_samples}; max IK error: {max_ik_error:.4f} m', flush=True)
+if args.motor_pose:
+    print(f'Motor max pose error after warmup: {max_motor_error:.4f} rad', flush=True)
 # Exact-boundary outward velocity, both axes and both characters.
 ids = torch.tensor([0], device='cuda:0')
 # Exercise stun independently of the defense decisions in the free fight.
 for side in range(2):
     env.reset()
+    obj = env._get_char_id() if side == 0 else env._get_opponent_id()
+    hit_start = env._engine.get_root_pos(obj)[0, :2].clone()
     env._receive_hit(ids, side)
     assert env._combat_state[0, side] == S.HIT_STUN
     for _ in range(12):
         env.step(action)
     assert env._combat_state[0, side] == S.RETREAT
+    stun_travel = torch.linalg.vector_norm(
+        env._engine.get_root_pos(obj)[0, :2] - hit_start)
+    assert 0.05 < stun_travel < 0.35, (side, float(stun_travel))
 assert ((env._stamina >= 0) & (env._stamina <= 1)).all()
 for obj in (env._get_char_id(), env._get_opponent_id()):
     pos = env._engine.get_root_pos(obj).clone()

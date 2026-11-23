@@ -1,6 +1,125 @@
-# MimicKit boks projesi
+# Stickman Boxing — geliştirme planı
 
-## Sıradaki çalışma planı
+## Fizik geçişi — yürürlükteki çalışma
+
+Önceki kinematik dövüş `c618a74` olarak `origin/main` dalına gönderildi.
+Yeni duruşta ayaklar yaklaşık 26 cm önde/arkada, dizler kırık ve pelvis 3 cm
+alçak. Destek bacağı IK çözümü iki Jacobian iterasyonunda kalça yan/ileri
+eksenleriyle dizi birlikte kullanır.
+
+`motor_pose` seçeneği eklem pozlarını doğrudan yazmak yerine Newton konum
+motorlarına hedef verir. Bu modda pelvis yüksekliği fizik ve temasla değişir;
+kökün yatay konumu ve yönü hâlâ dövüş denetleyicisi tarafından belirlenir.
+Gerçek ayak konumu basış çıpasını ve kök düzeltmesini besler. Mod varsayılan
+olmadan önce kökün yatay hareketi motor ve temas kuvvetleriyle üretilmeli.
+
+Üç eksenli IK ile 900 adımlık motor denemesinde destek ayağı kayması
+0.0394 m'den 0.0241 m'ye indi; iki taraflı isabet 6–2 kaldı. Temas 419/522
+basış örneğinde görüldü. Görsel motor denemesi 4–3 isabet, 377/458 temas ve
+0.0177 m en yüksek ayak kaymasıyla geçti. Kök konumu hâlâ doğrudan yazılıyor:
+başsız testte 0.0845 m, görsel testte 0.1043 m'ye varan düzeltme var. Kökü
+yalnız hızla taşıma denemesi 0.25 m üzeri kayma ürettiği için motor pilotuna
+alınmadı.
+
+Darbe tepkisinde eski `3.0 m/s` itme yaklaşık bir metre kaydırıyordu.
+`HIT_STUN` itmesi `0.55 m/s`, sonraki geri adım `0.30 m/s` oldu. Kontrollü
+test, darbeden sonraki ilk 0.4 saniyede toplam geri hareketin 0.35 m altında
+kalmasını denetler.
+
+Kalan fizik işleri: yatay kök düzeltmesini azaltmak, iki ayak için sürekli
+temas ve ağırlık aktarımı kurmak, yumruğun kalça/diz basışına bağlanması,
+darbe yönüne göre dengeli tepki. Motor kontrollü yatay adım ve denge
+ölçülmeden PPO eklenmeyecek.
+
+## Yeni hareketler ve gerçekçilik — uygulama sırası
+
+Mevcut saldırılar: sol jab, sağ cross, sol kroşe. `BLOCK`, tek yönlü `SLIP`
+ve `BACKSTEP` var. Yeni hareketler önce referans poz hedefi olarak eklenir;
+aynı hedef motor modunda da çalıştırılır. Bir hareket, yalnız görünmesiyle
+tamamlanmış sayılmaz: doğru menzilde isabet, savunmaya tepki, toparlanma ve
+basış testi gerekir.
+
+### 1. Duruş, pivot ve hareket temeli
+
+- Gard sırasında küçük ağırlık aktarımı; saldırıda ön/arka ayağın görevini
+  ayır. Rakibe dönüşü tek karede çevirmek yerine adımla pivot yap.
+- İleri/geri ve iki yöne yan adımı aynı basış denetimine bağla. Ring kenarında
+  pivotun içeri yönelmesini koru.
+- Kabul: başsız ve görsel 900 adımda iki taraflı isabet sürer; her iki yöne
+  hareket ve ring sınırı doğrulanır. Motor pilotunda en yüksek basış kayması
+  3 cm altında, temas oranı en az %80 kalır. Kök düzeltmesi ayrıca raporlanır.
+
+### 2. Yeni saldırılar — tek tek ekle
+
+**Ön koşul — vuruş doğruluğu:** Mevcut isabet hesabı iki eli ve baş/gövde
+hedeflerini birlikte tarıyor; mavi ve kırmızı tarafın kontrolü de farklı.
+İki tarafı ortak bir isabet hesabına taşı. Seçili hareketin eli ve hedef
+bölgesi dışında hasar verme. Her vuruşun aktif penceresinde en fazla bir
+isabet kaydet; kombinasyonun ikinci vuruşuna yeni hak aç.
+
+Her hareket için tek tanım tutulur: el, hedef bölgesi, menzil, animasyon
+süresi, aktif pencere, stamina bedeli, recovery, izinli kombinasyonlar ve
+basış/pivot hedefi. Aşağıdaki sayılar ilk kalibrasyon hedefidir; el yolu ve
+temas ölçümüne göre ayarlanır.
+
+| Sıra | Hareket | El / hedef | İlk menzil | Poz ve basış |
+| --- | --- | --- | --- | --- |
+| 1 | Sağ kroşe | Sağ / baş | 0.35–0.55 m | Dirsek bükülü yatay yay; arka ayak pivotu, kalça dönüşü |
+| 2 | Sağ uppercut | Sağ / baş | 0.25–0.45 m | El aşağıdan çeneye yükselir; diz açılır, ağırlık ön ayağa geçer |
+| 3 | Gövde jab'i | Sol / gövde | 0.45–0.65 m | Kısa seviye düşüşü; sol el yalnız torso/pelvis hedefler |
+
+Uygulama sırası: önce sağ kroşe ve hedefli testi, sonra uppercut ve hedefli
+testi, son olarak gövde jab'i ve hedefli testi. Yeni hareket için ayrı
+`CombatState` gerekmez; `ATTACK` içindeki hareket kimliği ve süreleri
+kullanılır. Seçilen vuruşun menziline yaklaşma kararı saldırı başlamadan
+verilir. Rakibin mesafesi, gardı ve stamina uygun olmayan hareketi eler;
+kalanlar arasındaki seçim ve kombinasyon sırası çeşitlenir.
+
+Her hareketin hedefli testi şunları kanıtlar: doğru el ve hedefte isabet;
+yanlış el/hedefte ve menzil dışında hasar yok; aktif pencere dışında isabet
+yok; tek vuruşta çift hasar yok; gard pozuna dönüş var. Sonra iki modda
+900 adımlık karşılıklı dövüş, ring/knockdown, ayak kayması ve 30 kare/saniye
+görsel kayıt kontrol edilir. Yeni hareket mevcut üç yumruğun isabetini
+bozmadan geçmelidir.
+
+### 3. Savunma ve karşılık
+
+- `SLIP` iki yöne ayrılır; duck ve gövde gardı eklenir. Kaçınma, yalnız poz
+  değişimiyle değil el/baş/gövde temas sonuçlarıyla doğrulanır.
+- Başarılı kaçınmadan sonra tek karşı yumruk fırsatı verilir. Savunma seçimi
+  rakibin vuruş yönü ve hedefiyle ilişkilendirilir; sabit BLOCK→SLIP→BACKSTEP
+  sırası kaldırılır.
+- Kabul: her savunma en az bir hedefli saldırıyı boşa çıkarır; blok hasarı
+  azaltır; karşılık cooldown ve stamina kurallarını aşmaz.
+
+### 4. Fizik geçişi ve tempo
+
+- Destek ayağına sürekli temas ve iki bacak arasında ağırlık aktarımı kur.
+  Kökün yatay konumunu doğrudan yazma gereksinimini azalt; bu değişimi
+  motor pilotunda ayrı ölç, başarısızsa varsayılan dövüşü koru.
+- Hareketler bu temelde kararlı çalışınca kombinasyon seçimini, saldırı
+  temposunu ve yorgunluk etkisini ayarla. PPO ancak motor denge ve iki
+  taraflı hasar kök düzeltmesi olmadan doğrulandıktan sonra değerlendirilir.
+
+**Yeni yumruk dilimi uygulandı:** iki taraf aynı isabet hesabını kullanıyor.
+Yalnız seçilen el ve hareketin hedeflediği bölge hasar verebiliyor. Sağ kroşe
+baş hedefli; 1.1 sn sürüyor, %30–58 aralığında aktif, 0.35–0.65 m menzilde,
+gövde ve arka ayak pivotu içeriyor. Sağ uppercut baş hedefli; 1.05 sn sürüyor,
+el önce alçalıp yükseliyor, %42–67 aralığında aktif, 0.25–0.65 m menzilde.
+Gövde jab'i sol elle torso/pelvis hedefli; 0.85 sn sürüyor, %25–60 aralığında
+aktif, 0.45–0.65 m menzilde. Her hareketin stamina bedeli ve toparlanma
+ayarı ayrı. İlk kroşe ve uppercut menzil hedefleri canlı hareket ve el
+geometrisine göre 0.65 m üst sınıra kalibre edildi. Bu hareketler kodla
+tanımlı; öğrenilmiş bir politika henüz yok.
+
+Hedefli test doğru el/hedef, yanlış el/hedef, menzil, aktif pencere,
+tek isabet ve cooldown kapılarını iki taraf için geçti. 900 adımlık
+varsayılan ve motor testleri karşılıklı hasar, ring, knockdown, temas ve ayak
+kayması denetimlerinden geçti. Görsel kayıt:
+`output/combat_humanoid/state_machine.mp4`. Sıradaki iş savunma ve karşılık
+hareketlerini saldırı yönü ve hedefe bağlamak.
+
+## Önceki çalışma planı
 
 1. Basış hedefini ring minderine bağla; destek temas oranını ölç. Tamamlandı.
 2. IK hata ve ayak kaymasını azaltırken iki taraflı dövüşü koru. İlk çözüm tamamlandı.
@@ -21,7 +140,7 @@ kontrolleri, ayak basışında ölçülen kayma ve temas oranı.
 Destek ayağı prototipi: ring minderi `ground*` sensöründe görünmediği için
 ayakların toplam temas kuvveti ve minder yüksekliği birlikte ölçülür.
 `foot_canvas_contact` iki tarafın sağ/sol temasını raporlar. Basış anında
-kalça ve diz için bir damped Jacobian IK adımı, kalan yatay sapma için kök
+kalça ve diz için iki damped Jacobian IK adımı, kalan yatay sapma için kök
 düzeltmesi kullanılır. Basış hedefi minder üstüne taşındı ve IK kuvvetlendirildi.
 Yumuşatılmış adım fazıyla 900 adımlık testlerde destek örneklerinin
 215–218/285'inde temas saptandı; mesafe değiştiren ayak çalışmasıyla başsız
@@ -84,7 +203,7 @@ GUARD / APPROACH / JAB / RECOVER / RETREAT
 hesaplanır. Combat demosu pozu doğrudan yazdığı için residual motor etkisi
 henüz doğrulanmış değildir.
 
-## Kalan aşamalar
+## Fizik geçişi için teknik işler
 
 1. Ayak-canvas temasını her basış boyunca doğrula; temas kuvveti ve ayak
    yüksekliğini ayrı raporla.
